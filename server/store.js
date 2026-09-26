@@ -96,4 +96,51 @@ class JsonStore {
   }
 }
 
-module.exports = { JsonStore, SEED_CUES };
+/**
+ * 单次排练实况记录的存取（与提示单分离的独立 JSON 文件）。
+ * 结构：{ rehearsal: null | { id, startedAt, cuesVersion, cues, schedule, records } }
+ */
+class RehearsalStore {
+  constructor(filePath) {
+    this.filePath = filePath;
+    this.rehearsal = null;
+  }
+
+  /** 首次启动若文件不存在则创建目录并写入空记录（初始化） */
+  init() {
+    const dir = path.dirname(this.filePath);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+    if (!fs.existsSync(this.filePath)) {
+      this.rehearsal = null;
+      this.persist();
+      return true;
+    }
+
+    const raw = fs.readFileSync(this.filePath, 'utf8');
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (e) {
+      throw new Error(`排练记录文件 ${this.filePath} 不是合法 JSON：${e.message}`);
+    }
+    const r = parsed.rehearsal;
+    if (r && typeof r === 'object') {
+      if (!Array.isArray(r.cues) || !Array.isArray(r.schedule) || typeof r.records !== 'object') {
+        throw new Error(`排练记录文件 ${this.filePath} 结构不完整（需要 cues / schedule / records）`);
+      }
+      this.rehearsal = r;
+    } else {
+      this.rehearsal = null;
+    }
+    return false;
+  }
+
+  persist() {
+    const tmp = `${this.filePath}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify({ rehearsal: this.rehearsal }, null, 2) + '\n', 'utf8');
+    fs.renameSync(tmp, this.filePath);
+  }
+}
+
+module.exports = { JsonStore, RehearsalStore, SEED_CUES };

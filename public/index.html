@@ -17,6 +17,52 @@
   <main class="wrap">
     <div id="banner" class="banner hidden"></div>
 
+    <section class="panel" id="rehearsalPanel">
+      <div class="panel-head">
+        <h2>🎬 实况排练台（单次排练）</h2>
+      </div>
+      <div id="rehError" class="banner err hidden"></div>
+
+      <div id="rehIdle">
+        <p class="hint">
+          点击「开始排练」将<strong>冻结当前提示单与重算计划</strong>作为本次排练基准；排练中按演出秒数逐条登记实际开始 / 结束，
+          记录自动持久化，刷新页面可继续。排练期间修改提示单<strong>不影响</strong>已冻结的排练；
+          「重置排练」清空登记记录后可开启新一轮，原提示单不变。
+        </p>
+        <div class="form-actions reh-start-actions">
+          <button type="button" class="btn primary" id="rehStartBtn">▶ 开始排练</button>
+        </div>
+      </div>
+
+      <div id="rehActive" hidden>
+        <div class="reh-bar">
+          <label class="reh-clock">当前演出秒数
+            <input type="number" id="rehClock" min="0" step="0.1" value="0" />
+          </label>
+          <button type="button" class="btn danger" id="rehResetBtn">↺ 重置排练（开启新一轮）</button>
+        </div>
+        <div class="frag-meta ok" id="rehMeta"></div>
+        <div class="table-wrap">
+          <table id="rehTable">
+            <thead>
+              <tr>
+                <th>#</th><th>名称</th><th>独占通道</th>
+                <th>计划开始(s)</th><th>计划结束(s)</th>
+                <th>实际开始(s)</th><th>实际结束(s)</th>
+                <th>开始偏差</th><th>结束偏差</th>
+                <th>状态</th><th>操作 / 阻止原因</th>
+              </tr>
+            </thead>
+            <tbody id="rehTbody"></tbody>
+          </table>
+        </div>
+        <p class="hint reh-legend">
+          登记「开始」需同时满足：前置提示已实际结束且达到其实际结束 + 延迟（固定提示达到固定秒数）、本通道无进行中提示、
+          不早于本通道最后一次实际结束；登记「结束」的秒数不得早于其实际开始。偏差为实际 − 计划（+ 表示晚了，− 表示早了）。
+        </p>
+      </div>
+    </section>
+
     <section class="panel">
       <div class="panel-head">
         <h2 id="timelineTitle">时间轴（按通道）</h2>

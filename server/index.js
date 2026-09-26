@@ -3,16 +3,21 @@
 const path = require('path');
 const crypto = require('crypto');
 const express = require('express');
-const { JsonStore } = require('./store');
-const { evaluate, validateCueBody } = require('./scheduler');
+const { JsonStore, RehearsalStore } = require('./store');
+const { evaluate, validateCueBody, round } = require('./scheduler');
 const { buildFragment } = require('./fragment');
 const { cuesVersion, planDeferral } = require('./defer');
+const { createRehearsal, checkStart, checkEnd, rehearsalView } = require('./rehearsal');
 
 const PORT = parseInt(process.env.PORT, 10) || 3000;
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, '..', 'data', 'cues.json');
+const REHEARSAL_FILE =
+  process.env.REHEARSAL_FILE || path.join(path.dirname(DATA_FILE), 'rehearsal.json');
 
 const store = new JsonStore(DATA_FILE);
 const seeded = store.init();
+const rehearsalStore = new RehearsalStore(REHEARSAL_FILE);
+const rehearsalSeeded = rehearsalStore.init();
 
 const app = express();
 app.use(express.json());
@@ -199,6 +204,89 @@ app.get('/api/fragments/download', (req, res) => {
   res.send(JSON.stringify(result.document, null, 2) + '\n');
 });
 
+// ---- 实况排练台（单次排练：冻结计划、按演出秒数登记实际开始/结束、持久化、可重置）----
+
+app.get('/api/rehearsal', (req, res) => {
+  res.json({
+    rehearsal: rehearsalStore.rehearsal ? rehearsalView(rehearsalStore.rehearsal) : null,
+  });
+});
+
+app.post('/api/rehearsal/start', (req, res) => {
+  if (rehearsalStore.rehearsal) {
+    return fail(res, 409, '已有进行中的排练，请先「重置排练」再开启新一轮', {
+      code: 'already_active',
+    });
+  }
+  let rehearsal;
+  try {
+    rehearsal = createRehearsal(store.cues); // 冻结当前提示单与重算计划
+  } catch (e) {
+    return fail(res, e.status || 400, e.message, { errors: e.errors || [e.message] });
+  }
+  rehearsalStore.rehearsal = rehearsal;
+  rehearsalStore.persist();
+  res.status(201).json({ ok: true, rehearsal: rehearsalView(rehearsal) });
+});
+
+function parseShowSecond(raw) {
+  if (typeof raw === 'boolean' || raw === null || raw === undefined || String(raw).trim() === '') {
+    return { error: '演出秒数必须填写数字' };
+  }
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return { error: '演出秒数必须是数字' };
+  if (n < 0) return { error: '演出秒数不能为负数' };
+  return { value: round(n) };
+}
+
+function rehearsalRecordHandler(kind) {
+  return (req, res) => {
+    const rehearsal = rehearsalStore.rehearsal;
+    if (!rehearsal) {
+      return fail(res, 409, '当前没有进行中的排练，请先「开始排练」', { code: 'no_active' });
+    }
+
+    const body = req.body || {};
+    const cueId = typeof body.cueId === 'string' ? body.cueId.trim() : '';
+    if (!cueId) return fail(res, 400, '缺少要登记的提示 cueId');
+
+    const at = parseShowSecond(body.at);
+    if (at.error) return fail(res, 400, at.error);
+
+    let check;
+    try {
+      check = kind === 'start' ? checkStart(rehearsal, cueId, at.value) : checkEnd(rehearsal, cueId, at.value);
+    } catch (e) {
+      return fail(res, e.status || 400, e.message, { errors: e.errors || [e.message] });
+    }
+    if (!check.ok) {
+      return fail(res, 409, kind === 'start' ? '当前不允许登记实际开始' : '当前不允许登记实际结束', {
+        code: kind === 'start' ? 'start_blocked' : 'end_blocked',
+        errors: check.reasons,
+        reasons: check.reasons,
+      });
+    }
+
+    const rec = rehearsal.records[cueId] || { actualStart: null, actualEnd: null };
+    if (kind === 'start') rec.actualStart = at.value;
+    else rec.actualEnd = at.value;
+    rehearsal.records[cueId] = rec;
+
+    rehearsalStore.persist(); // 原子写入（临时文件 + rename），刷新后可继续
+    res.json({ ok: true, rehearsal: rehearsalView(rehearsal) });
+  };
+}
+
+app.post('/api/rehearsal/records/start', rehearsalRecordHandler('start'));
+app.post('/api/rehearsal/records/end', rehearsalRecordHandler('end'));
+
+app.post('/api/rehearsal/reset', (req, res) => {
+  // 只清空排练记录，不修改原提示单
+  rehearsalStore.rehearsal = null;
+  rehearsalStore.persist();
+  res.json({ ok: true, rehearsal: null });
+});
+
 app.use((err, req, res, next) => {
   if (err && err.type === 'entity.parse.failed') {
     return fail(res, 400, '请求体不是合法 JSON');
@@ -211,6 +299,7 @@ app.use(express.static(path.join(__dirname, '..', 'public')));
 
 const server = app.listen(PORT, () => {
   console.log(`[cue-sheet] 数据文件: ${DATA_FILE}${seeded ? '（不存在，已初始化示例数据）' : ''}`);
+  console.log(`[cue-sheet] 排练记录文件: ${REHEARSAL_FILE}${rehearsalSeeded ? '（不存在，已初始化空记录）' : ''}`);
   console.log(`[cue-sheet] 服务已启动: http://localhost:${PORT}`);
 });
 

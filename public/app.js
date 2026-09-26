@@ -7,6 +7,7 @@ let fragment = null; // 当前片段预览结果
 let fragmentStale = false; // 原提示单发生增删改后，旧预览失效
 let deferPlan = null; // 当前顺延预演结果
 let deferStale = false; // 提示单发生增删改后，旧预演失效（确认时服务端也会再核对版本）
+let rehearsal = null; // 当前排练视图（GET /api/rehearsal 的 rehearsal；null 表示无进行中排练）
 
 const $ = (sel) => document.querySelector(sel);
 const el = (tag, cls, text) => {
@@ -52,11 +53,16 @@ async function api(method, url, body) {
 }
 
 async function reload(notice) {
-  const data = await api('GET', '/api/cues');
-  state = data;
+  const [cuesData, rehData] = await Promise.all([
+    api('GET', '/api/cues'),
+    api('GET', '/api/rehearsal'),
+  ]);
+  state = cuesData;
+  rehearsal = rehData.rehearsal;
   markFragmentStale();
   markDeferStale();
   render();
+  renderRehearsal();
   if (notice) showBanner(notice, 'ok');
 }
 
@@ -795,6 +801,238 @@ async function confirmDeferral() {
   }
 }
 
+// ---------------- 实况排练台 ----------------
+function showRehError(messages) {
+  const box = $('#rehError');
+  box.className = 'banner err';
+  box.innerHTML = '';
+  box.append(el('strong', null, '排练操作被拒绝：'));
+  const ul = el('ul');
+  ul.style.margin = '6px 0 0';
+  ul.style.paddingLeft = '18px';
+  for (const m of [].concat(messages)) ul.append(el('li', null, m));
+  box.append(ul);
+  box.classList.remove('hidden');
+}
+function hideRehError() {
+  $('#rehError').classList.add('hidden');
+}
+
+function rehClock() {
+  const raw = $('#rehClock').value;
+  if (raw === null || String(raw).trim() === '') return null;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
+function rehRecOf(cueId) {
+  const rec = rehearsal && rehearsal.records ? rehearsal.records[cueId] : null;
+  return {
+    actualStart: rec && rec.actualStart !== undefined ? rec.actualStart : null,
+    actualEnd: rec && rec.actualEnd !== undefined ? rec.actualEnd : null,
+  };
+}
+function rehCue(id) {
+  return rehearsal.cues.find((c) => c.id === id);
+}
+
+// 与服务端 checkStart 一致的本地预判，用于随演出秒数实时展示阻止原因（服务端仍会权威校验）
+function rehStartReasons(cueId, at) {
+  const cue = rehCue(cueId);
+  if (!cue) return ['提示不在本次排练中'];
+  const reasons = [];
+  const rec = rehRecOf(cueId);
+  if (rec.actualStart !== null) {
+    reasons.push(rec.actualEnd !== null ? '该提示已完成' : '该提示已在进行中');
+  }
+  if (cue.startType === 'after') {
+    const pred = rehCue(cue.afterCueId);
+    const predRec = rehRecOf(cue.afterCueId);
+    if (predRec.actualEnd === null) {
+      reasons.push(`前置提示${pred ? `「${pred.name}」` : ''}尚未登记实际结束`);
+    } else {
+      const earliest = predRec.actualEnd + cue.delayAfter;
+      if (at < earliest - 1e-9) {
+        reasons.push(`未达到前置实际结束 +${fmtNum(cue.delayAfter)}s 延迟（最早可于 ${fmtNum(earliest)}s 开始）`);
+      }
+    }
+  } else if (at < cue.fixedAt - 1e-9) {
+    reasons.push(`未达到固定开始秒数（第 ${fmtNum(cue.fixedAt)}s）`);
+  }
+  let busyName = null;
+  let lastEnd = null;
+  for (const o of rehearsal.cues) {
+    if (o.id === cueId || o.channel !== cue.channel) continue;
+    const r = rehRecOf(o.id);
+    if (r.actualStart !== null && r.actualEnd === null) busyName = o.name;
+    if (r.actualEnd !== null && (lastEnd === null || r.actualEnd > lastEnd)) lastEnd = r.actualEnd;
+  }
+  if (busyName !== null) reasons.push(`通道「${cue.channel}」上「${busyName}」正在进行中`);
+  if (lastEnd !== null && at < lastEnd - 1e-9) {
+    reasons.push(`早于本通道最后一次实际结束（${fmtNum(lastEnd)}s）`);
+  }
+  return reasons;
+}
+
+function rehEndReasons(cueId, at) {
+  const rec = rehRecOf(cueId);
+  if (rec.actualStart === null) return ['该提示尚未登记实际开始'];
+  if (rec.actualEnd !== null) return ['该提示已登记实际结束'];
+  if (at < rec.actualStart - 1e-9) {
+    return [`结束秒数（${fmtNum(at)}s）不得早于实际开始（${fmtNum(rec.actualStart)}s）`];
+  }
+  return [];
+}
+
+const REH_STATUS = {
+  pending: { cls: 'unknown', text: '未开始' },
+  running: { cls: 'run', text: '进行中' },
+  done: { cls: 'ok', text: '已完成' },
+};
+
+function deltaCell(d) {
+  const td = el('td', 'num');
+  if (d === null || d === undefined) {
+    td.textContent = '—';
+    return td;
+  }
+  const span = el('span');
+  if (d > 1e-9) {
+    span.className = 'delta-late';
+    span.textContent = `+${fmtNum(d)}s`;
+    span.title = `实际比计划晚 ${fmtNum(d)}s`;
+  } else if (d < -1e-9) {
+    span.className = 'delta-early';
+    span.textContent = `-${fmtNum(-d)}s`;
+    span.title = `实际比计划早 ${fmtNum(-d)}s`;
+  } else {
+    span.className = 'delta-zero';
+    span.textContent = '0s';
+    span.title = '与计划一致';
+  }
+  td.append(span);
+  return td;
+}
+
+function renderRehearsal() {
+  const idle = $('#rehIdle');
+  const active = $('#rehActive');
+  if (!rehearsal) {
+    idle.hidden = false;
+    active.hidden = true;
+    return;
+  }
+  idle.hidden = true;
+  active.hidden = false;
+
+  const c = rehearsal.counts;
+  $('#rehMeta').textContent =
+    `排练 ${rehearsal.id} ｜ 开始于 ${new Date(rehearsal.startedAt).toLocaleString()}` +
+    ` ｜ 冻结 ${c.total} 条提示 ｜ ✅ 已完成 ${c.done} ｜ ▶ 进行中 ${c.running} ｜ ⏳ 未开始 ${c.pending}`;
+
+  const at = rehClock();
+  const tbody = $('#rehTbody');
+  tbody.innerHTML = '';
+
+  rehearsal.items.forEach((it, i) => {
+    const tr = el('tr');
+    if (it.status === 'running') tr.classList.add('row-running');
+    if (it.status === 'done') tr.classList.add('row-done');
+
+    tr.append(el('td', 'num', String(i + 1)));
+    tr.append(el('td', 'name-cell', it.name));
+    tr.append(el('td', null, it.channel));
+    tr.append(el('td', 'num', fmtNum(it.plannedStart)));
+    tr.append(el('td', 'num', fmtNum(it.plannedEnd)));
+    tr.append(el('td', 'num', it.actualStart === null ? '—' : fmtNum(it.actualStart)));
+    tr.append(el('td', 'num', it.actualEnd === null ? '—' : fmtNum(it.actualEnd)));
+    tr.append(deltaCell(it.startDelta));
+    tr.append(deltaCell(it.endDelta));
+
+    const st = REH_STATUS[it.status];
+    const statusTd = el('td');
+    statusTd.append(el('span', `pill ${st.cls}`, st.text));
+    tr.append(statusTd);
+
+    const actTd = el('td');
+    if (it.status === 'done') {
+      actTd.append(el('span', 'rel-muted', '—'));
+    } else {
+      const kind = it.status === 'pending' ? 'start' : 'end';
+      const reasons = at === null
+        ? ['请先在上方填写当前演出秒数（非负数字）']
+        : kind === 'start'
+          ? rehStartReasons(it.cueId, at)
+          : rehEndReasons(it.cueId, at);
+      const btn = el('button', 'btn small primary', kind === 'start' ? '登记开始' : '登记结束');
+      btn.type = 'button';
+      btn.disabled = reasons.length > 0;
+      btn.title = `以第 ${at === null ? '?' : fmtNum(at)}s 登记实际${kind === 'start' ? '开始' : '结束'}`;
+      btn.addEventListener('click', () => rehearsalRecord(kind, it.cueId));
+      actTd.append(btn);
+      if (reasons.length) {
+        const ul = el('ul', 'reh-reasons');
+        for (const r of reasons) ul.append(el('li', null, r));
+        actTd.append(ul);
+      }
+    }
+    tr.append(actTd);
+    tbody.append(tr);
+  });
+}
+
+async function startRehearsal() {
+  const btn = $('#rehStartBtn');
+  btn.disabled = true;
+  try {
+    const data = await api('POST', '/api/rehearsal/start');
+    rehearsal = data.rehearsal;
+    hideRehError();
+    renderRehearsal();
+    showBanner('已开始排练：当前提示单与重算计划已冻结', 'ok');
+  } catch (err) {
+    showRehError(err.errors || [err.message]);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function rehearsalRecord(kind, cueId) {
+  const at = rehClock();
+  if (at === null) {
+    showRehError(['请先在「当前演出秒数」填写非负数字']);
+    return;
+  }
+  try {
+    const data = await api('POST', `/api/rehearsal/records/${kind}`, { cueId, at });
+    rehearsal = data.rehearsal;
+    hideRehError();
+    renderRehearsal();
+    showBanner(kind === 'start' ? '已登记实际开始' : '已登记实际结束', 'ok');
+  } catch (err) {
+    showRehError(err.errors || [err.message]);
+    // 可能被服务端权威校验拒绝（状态已变化），重新拉取最新排练视图
+    try {
+      const fresh = await api('GET', '/api/rehearsal');
+      rehearsal = fresh.rehearsal;
+      renderRehearsal();
+    } catch (_) { /* 忽略刷新失败 */ }
+  }
+}
+
+async function resetRehearsal() {
+  if (!confirm('确定重置本次排练？\n将清除全部实际登记记录并允许开启新一轮排练（原提示单不受影响）。')) return;
+  try {
+    await api('POST', '/api/rehearsal/reset');
+    rehearsal = null;
+    hideRehError();
+    renderRehearsal();
+    showBanner('已重置，可开始新一轮排练', 'ok');
+  } catch (err) {
+    showRehError(err.errors || [err.message]);
+  }
+}
+
 // ---------------- 初始化 ----------------
 document.querySelectorAll('input[name="startType"]').forEach((r) =>
   r.addEventListener('change', syncStartBoxes)
@@ -805,6 +1043,11 @@ $('#fragmentForm').addEventListener('submit', previewFragment);
 $('#frDownloadBtn').addEventListener('click', downloadFragment);
 $('#deferConfirmBtn').addEventListener('click', confirmDeferral);
 $('#deferCancelBtn').addEventListener('click', () => clearDefer());
+$('#rehStartBtn').addEventListener('click', startRehearsal);
+$('#rehResetBtn').addEventListener('click', resetRehearsal);
+$('#rehClock').addEventListener('input', () => {
+  if (rehearsal) renderRehearsal();
+});
 
 syncStartBoxes();
 reload().catch((err) => showBanner(`加载失败：${err.message}`, 'err', true));
