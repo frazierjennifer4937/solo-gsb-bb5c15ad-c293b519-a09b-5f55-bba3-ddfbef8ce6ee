@@ -7,6 +7,9 @@ let fragment = null; // 当前片段预览结果
 let fragmentStale = false; // 原提示单发生增删改后，旧预览失效
 let deferPlan = null; // 当前顺延预演结果
 let deferStale = false; // 提示单发生增删改后，旧预演失效（确认时服务端也会再核对版本）
+let rehearsal = null; // 当前排练实况视图（null = 未开始）
+let rehBusy = false; // 排练登记请求进行中，防重复提交
+let rehLoadSeq = 0; // 丢弃因快速输入产生的过期响应
 
 const $ = (sel) => document.querySelector(sel);
 const el = (tag, cls, text) => {
@@ -42,7 +45,9 @@ async function api(method, url, body) {
   try { data = await res.json(); } catch (_) { /* 非 JSON */ }
   if (!res.ok) {
     const msg = (data && data.error && data.error.message) || `请求失败（${res.status}）`;
-    const errors = (data && data.error && data.error.errors) || [msg];
+    const rawErrors =
+      (data && data.error && (data.error.errors || data.error.reasons)) || [msg];
+    const errors = rawErrors.map((x) => (typeof x === 'string' ? x : x.message));
     const e = new Error(msg);
     e.errors = errors;
     e.status = res.status;
@@ -57,7 +62,243 @@ async function reload(notice) {
   markFragmentStale();
   markDeferStale();
   render();
+  await loadRehearsal();
   if (notice) showBanner(notice, 'ok');
+}
+
+// ---------------- 排练实况 ----------------
+function currentClockAt() {
+  const raw = $('#rehClock').value;
+  if (String(raw).trim() === '') return null;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return n;
+}
+
+async function loadRehearsal() {
+  const at = rehearsal ? currentClockAt() : null;
+  const qs = at === null ? '' : `?at=${encodeURIComponent(at)}`;
+  const seq = ++rehLoadSeq;
+  const data = await api('GET', `/api/rehearsal${qs}`);
+  if (seq !== rehLoadSeq) return; // 已被更新的请求取代
+  rehearsal = data.active ? data.rehearsal : null;
+  renderRehearsal();
+}
+
+function renderRehearsal() {
+  const idle = $('#rehIdle');
+  const active = $('#rehActive');
+  if (!rehearsal) {
+    idle.hidden = false;
+    active.hidden = true;
+    const hasUnresolved = state.graphErrors && state.graphErrors.length > 0;
+    $('#rehIdleHint').textContent = hasUnresolved
+      ? '⚠️ 当前提示单存在时间未定的提示，需先解决引用 / 循环依赖问题后才能开始。'
+      : `共 ${state.cues.length} 条提示，开始后将冻结此刻的重算计划。`;
+    return;
+  }
+  idle.hidden = true;
+  active.hidden = false;
+
+  const summary = $('#rehSummary');
+  summary.innerHTML = '';
+  summary.append(
+    el('span', 'reh-stat', `已完成 ${rehearsal.doneCount}/${rehearsal.frozenCueCount}`),
+    el('span', 'reh-stat', `进行中 ${rehearsal.runningCount}`),
+    el('span', 'reh-stat', `未开始 ${rehearsal.pendingCount}`)
+  );
+  if (rehearsal.allDone) summary.append(el('span', 'pill ok', '🎉 本轮全部登记完成'));
+  const started = new Date(rehearsal.startedAt);
+  summary.append(el('span', 'reh-stat', `冻结于 ${started.toLocaleString()}`));
+
+  const stale = $('#rehStale');
+  if (rehearsal.versionMismatch) {
+    stale.className = 'banner info';
+    stale.textContent = '⚠️ 开始排练后原提示单已被增删改；本轮仍按冻结时的计划与提示执行，不受影响。重置后再开始才会使用最新提示单。';
+    stale.classList.remove('hidden');
+  } else {
+    stale.classList.add('hidden');
+  }
+
+  const tbody = $('#rehTbody');
+  tbody.innerHTML = '';
+  const at = currentClockAt();
+
+  rehearsal.items.forEach((item) => {
+    const tr = el('tr');
+    tr.classList.add(`reh-${item.status}`);
+    tr.append(el('td', 'num', String(item.order + 1)));
+    tr.append(el('td', 'name-cell', item.name));
+    tr.append(el('td', null, item.channel));
+    tr.append(el('td', null, rehStartDesc(item)));
+    tr.append(el('td', 'num', fmtNum(item.plannedStart)));
+    tr.append(el('td', 'num', fmtNum(item.plannedEnd)));
+    tr.append(el('td', 'num', fmtNum(item.actualStart)));
+    tr.append(el('td', 'num', fmtNum(item.actualEnd)));
+    tr.append(el('td', 'num reh-delta', rehDeltaText(item.startDelta)));
+    tr.append(el('td', 'num reh-delta', rehDeltaText(item.endDelta)));
+
+    const statusTd = el('td');
+    if (item.status === 'done') statusTd.append(el('span', 'pill ok', '✅ 已完成'));
+    else if (item.status === 'running') statusTd.append(el('span', 'pill reh-run', '🔴 进行中'));
+    else statusTd.append(el('span', 'pill unknown', '⏳ 未开始'));
+    tr.append(statusTd);
+
+    tr.append(rehActionCell(item, at));
+    tbody.append(tr);
+  });
+}
+
+function rehStartDesc(item) {
+  if (item.startType === 'fixed') return `固定第 ${fmtNum(item.fixedAt)}s`;
+  return `「${item.predecessorName || '（已删除）'}」结束 +${fmtNum(item.delayAfter)}s`;
+}
+
+function rehDeltaText(delta) {
+  if (delta === null || delta === undefined) return '—';
+  if (Math.abs(delta) <= 1e-6) return '0';
+  const sign = delta > 0 ? '+' : '';
+  return `${sign}${fmtNum(delta)}s`;
+}
+
+function rehActionCell(item, at) {
+  const td = el('td', 'reh-actions');
+
+  if (item.status === 'done') {
+    td.append(el('span', 'rel-muted', '—'));
+    return td;
+  }
+
+  if (item.status === 'running') {
+    const reasons = [];
+    if (at === null) reasons.push('请在上方填写当前演出秒数');
+    else if (at + 1e-9 < item.actualStart) {
+      reasons.push(`结束秒数（${fmtNum(at)}s）不得早于开始秒数（${fmtNum(item.actualStart)}s）`);
+    }
+    const btn = el('button', 'btn small primary', `登记结束 @${at === null ? '?' : fmtNum(at)}s`);
+    btn.type = 'button';
+    btn.disabled = reasons.length > 0 || rehBusy;
+    btn.title = '登记本提示的实际结束秒数';
+    btn.addEventListener('click', () => submitRehearsalMark(item.cueId, 'end'));
+    td.append(btn);
+    if (reasons.length) {
+      const ul = rehReasonList(reasons);
+      td.append(ul);
+    }
+    return td;
+  }
+
+  // pending：未开始
+  const clockMissing = at === null;
+  const blockers = item.blockers || [];
+  const btn = el('button', 'btn small primary', `登记开始 @${at === null ? '?' : fmtNum(at)}s`);
+  btn.type = 'button';
+  btn.disabled = clockMissing || blockers.length > 0 || rehBusy;
+  btn.title = clockMissing ? '请先在上方填写当前演出秒数' : '登记本提示的实际开始秒数';
+  btn.addEventListener('click', () => submitRehearsalMark(item.cueId, 'start'));
+  td.append(btn);
+
+  // 与秒数无关的阻止原因（前置未结束 / 本通道忙）即使未填秒数也展示
+  const staticBlockers = blockers
+    .filter((b) => b.code === 'predecessor_open' || b.code === 'channel_busy')
+    .map((b) => b.message);
+  if (staticBlockers.length) {
+    td.append(rehReasonList(staticBlockers));
+  } else if (clockMissing) {
+    td.append(rehReasonList(['请在上方填写当前演出秒数']));
+  } else if (blockers.length) {
+    td.append(rehReasonList(blockers.map((b) => b.message)));
+  }
+  return td;
+}
+
+function rehReasonList(messages) {
+  const ul = el('ul', 'reh-block');
+  for (const m of messages) ul.append(el('li', null, `⛔ ${m}`));
+  return ul;
+}
+
+function showRehError(message, messages) {
+  const box = $('#rehError');
+  box.className = 'banner err';
+  box.innerHTML = '';
+  box.append(el('strong', null, message));
+  if (messages && messages.length) {
+    const ul = el('ul');
+    ul.style.margin = '6px 0 0';
+    ul.style.paddingLeft = '18px';
+    for (const m of messages) ul.append(el('li', null, m));
+    box.append(ul);
+  }
+  box.classList.remove('hidden');
+}
+function hideRehError() {
+  $('#rehError').classList.add('hidden');
+}
+
+async function submitRehearsalMark(cueId, kind) {
+  const at = currentClockAt();
+  if (at === null) return;
+  rehBusy = true;
+  hideRehError();
+  renderRehearsal();
+  try {
+    await api('POST', `/api/rehearsal/cues/${encodeURIComponent(cueId)}/${kind}`, { at });
+    await loadRehearsal();
+  } catch (err) {
+    const head = kind === 'start' ? '开始登记被阻止：' : '结束登记被拒绝：';
+    showRehError(head, err.errors || [err.message]);
+    await loadRehearsal(); // 仍刷新一次，保证状态一致
+  } finally {
+    rehBusy = false;
+    renderRehearsal();
+  }
+}
+
+async function startRehearsal() {
+  const btn = $('#rehStartBtn');
+  btn.disabled = true;
+  try {
+    await api('POST', '/api/rehearsal/start');
+    hideRehError();
+    await loadRehearsal();
+    showBanner('已开始排练：当前提示与重算计划已冻结，可逐条登记实际开始 / 结束', 'ok');
+  } catch (err) {
+    // 开始失败时活动面板仍隐藏，错误通过顶部横幅展示
+    const b = $('#banner');
+    b.className = 'banner err';
+    b.innerHTML = '';
+    b.append(el('strong', null, '无法开始排练：'));
+    const ul = el('ul');
+    ul.style.margin = '6px 0 0';
+    ul.style.paddingLeft = '18px';
+    for (const m of err.errors || [err.message]) ul.append(el('li', null, m));
+    b.append(ul);
+    b.classList.remove('hidden');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function resetRehearsal() {
+  if (!rehearsal) return;
+  const ok = confirm(
+    '确定重置本轮排练？\n\n' +
+    '· 冻结计划与全部实际开始 / 结束登记都会被清除；\n' +
+    '· 原提示单不会被修改；\n' +
+    '· 再次「开始排练」将按当前最新提示单重新冻结。'
+  );
+  if (!ok) return;
+  try {
+    await api('POST', '/api/rehearsal/reset');
+    rehearsal = null;
+    $('#rehClock').value = '';
+    hideRehError();
+    renderRehearsal();
+    showBanner('已重置本轮排练，可开始新一轮', 'ok');
+  } catch (err) {
+    showBanner(err.message, 'err');
+  }
 }
 
 // ---------------- 顶部提示条 ----------------
@@ -805,6 +1046,17 @@ $('#fragmentForm').addEventListener('submit', previewFragment);
 $('#frDownloadBtn').addEventListener('click', downloadFragment);
 $('#deferConfirmBtn').addEventListener('click', confirmDeferral);
 $('#deferCancelBtn').addEventListener('click', () => clearDefer());
+$('#rehStartBtn').addEventListener('click', startRehearsal);
+$('#rehResetBtn').addEventListener('click', resetRehearsal);
+// 演出秒数变化即按该秒数重算各行的「可开始 / 被阻止原因」（只读刷新）
+let rehClockTimer = null;
+$('#rehClock').addEventListener('input', () => {
+  if (!rehearsal) return;
+  clearTimeout(rehClockTimer);
+  rehClockTimer = setTimeout(() => {
+    loadRehearsal().catch(() => {});
+  }, 120);
+});
 
 syncStartBoxes();
 reload().catch((err) => showBanner(`加载失败：${err.message}`, 'err', true));

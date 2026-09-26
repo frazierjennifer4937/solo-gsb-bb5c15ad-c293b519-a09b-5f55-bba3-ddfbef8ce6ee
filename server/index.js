@@ -3,16 +3,27 @@
 const path = require('path');
 const crypto = require('crypto');
 const express = require('express');
-const { JsonStore } = require('./store');
+const { JsonStore, RehearsalStore } = require('./store');
 const { evaluate, validateCueBody } = require('./scheduler');
 const { buildFragment } = require('./fragment');
 const { cuesVersion, planDeferral } = require('./defer');
+const {
+  createSession,
+  markStart,
+  markEnd,
+  parseAt,
+  sessionView,
+} = require('./rehearsal');
 
 const PORT = parseInt(process.env.PORT, 10) || 3000;
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, '..', 'data', 'cues.json');
+const REHEARSAL_FILE =
+  process.env.REHEARSAL_FILE || path.join(path.dirname(DATA_FILE), 'rehearsal.json');
 
 const store = new JsonStore(DATA_FILE);
 const seeded = store.init();
+const rehearsalStore = new RehearsalStore(REHEARSAL_FILE);
+rehearsalStore.load(); // 文件不存在时返回 null（尚未开始排练），刷新后仍可继续
 
 const app = express();
 app.use(express.json());
@@ -31,6 +42,17 @@ function snapshot() {
 
 function fail(res, status, message, extra = {}) {
   return res.status(status).json({ error: { message, ...extra } });
+}
+
+function rehearsalSnapshot(at) {
+  if (!rehearsalStore.session) return { active: false };
+  return { active: true, rehearsal: sessionView(rehearsalStore.session, store.cues, at) };
+}
+
+// 从 query（GET）或 body 读取可选的当前演出秒数；非法时抛出带 status 的错误
+function readAt(src) {
+  if (src === undefined || src === null || String(src).trim() === '') return null;
+  return parseAt(src, '当前演出秒数');
 }
 
 // ---- API ----
@@ -168,6 +190,74 @@ app.post('/api/deferrals/confirm', (req, res) => {
   res.json({ ok: true, applied: plan, ...snapshot() });
 });
 
+// ---- 单次排练实况执行台（冻结计划；登记持久化；重置不改原提示单）----
+
+app.get('/api/rehearsal', (req, res) => {
+  let at = null;
+  try {
+    at = readAt(req.query.at);
+  } catch (e) {
+    return fail(res, e.status || 400, e.message);
+  }
+  res.json(rehearsalSnapshot(at));
+});
+
+app.post('/api/rehearsal/start', (req, res) => {
+  if (rehearsalStore.session) {
+    return fail(res, 409, '已有一轮排练进行中，请先重置后再开始新一轮', {
+      code: 'already_active',
+    });
+  }
+  let session;
+  try {
+    session = createSession(store.cues); // 存在时间未定的提示时返回 400
+  } catch (e) {
+    return fail(res, e.status || 400, e.message, { reasons: e.reasons || [e.message] });
+  }
+  rehearsalStore.save(session);
+  res.status(201).json({ ok: true, ...rehearsalSnapshot(null) });
+});
+
+app.post('/api/rehearsal/cues/:id/start', (req, res) => {
+  if (!rehearsalStore.session) return fail(res, 409, '尚未开始排练', { code: 'not_active' });
+  let at;
+  try {
+    at = parseAt(req.body && req.body.at, '实际开始秒数');
+  } catch (e) {
+    return fail(res, e.status || 400, e.message);
+  }
+  try {
+    markStart(rehearsalStore.session, req.params.id, at);
+  } catch (e) {
+    return fail(res, e.status || 400, e.message, { reasons: e.reasons || [e.message] });
+  }
+  rehearsalStore.save(rehearsalStore.session);
+  res.json({ ok: true, ...rehearsalSnapshot(at) });
+});
+
+app.post('/api/rehearsal/cues/:id/end', (req, res) => {
+  if (!rehearsalStore.session) return fail(res, 409, '尚未开始排练', { code: 'not_active' });
+  let at;
+  try {
+    at = parseAt(req.body && req.body.at, '实际结束秒数');
+  } catch (e) {
+    return fail(res, e.status || 400, e.message);
+  }
+  try {
+    markEnd(rehearsalStore.session, req.params.id, at);
+  } catch (e) {
+    return fail(res, e.status || 400, e.message, { reasons: e.reasons || [e.message] });
+  }
+  rehearsalStore.save(rehearsalStore.session);
+  res.json({ ok: true, ...rehearsalSnapshot(at) });
+});
+
+app.post('/api/rehearsal/reset', (req, res) => {
+  // 仅删除排练记录（冻结快照与实际登记），原提示单不做任何修改
+  rehearsalStore.clear();
+  res.json({ ok: true, active: false });
+});
+
 // ---- 片段排练单（只读，不修改原提示单）----
 
 function fragmentParams(req) {
@@ -211,6 +301,7 @@ app.use(express.static(path.join(__dirname, '..', 'public')));
 
 const server = app.listen(PORT, () => {
   console.log(`[cue-sheet] 数据文件: ${DATA_FILE}${seeded ? '（不存在，已初始化示例数据）' : ''}`);
+  console.log(`[cue-sheet] 排练记录文件: ${REHEARSAL_FILE}${rehearsalStore.session ? '（检测到未结束的排练，可继续登记）' : ''}`);
   console.log(`[cue-sheet] 服务已启动: http://localhost:${PORT}`);
 });
 

@@ -13,6 +13,8 @@ COPY public ./public
 # 数据文件目录（由挂载卷持久化；首次启动自动初始化示例 JSON）
 RUN mkdir -p /app/data
 ENV DATA_FILE=/app/data/cues.json
+# 单次排练实况记录（冻结计划与实际开始/结束登记），与提示单分文件存放
+ENV REHEARSAL_FILE=/app/data/rehearsal.json
 ENV PORT=3000
 ENV NODE_ENV=production
 

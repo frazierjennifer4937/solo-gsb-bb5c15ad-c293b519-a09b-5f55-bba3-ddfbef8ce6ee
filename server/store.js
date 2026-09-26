@@ -96,4 +96,51 @@ class JsonStore {
   }
 }
 
-module.exports = { JsonStore, SEED_CUES };
+/**
+ * 单次排练实况的存取：整轮冻结计划与逐条实际登记保存在独立 JSON，
+ * 与提示单文件互不影响；重置只清空本文件。文件不存在视为尚未开始排练。
+ */
+class RehearsalStore {
+  constructor(filePath) {
+    this.filePath = filePath;
+    this.session = null;
+  }
+
+  load() {
+    const dir = path.dirname(this.filePath);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+    if (!fs.existsSync(this.filePath)) {
+      this.session = null;
+      return null;
+    }
+    const raw = fs.readFileSync(this.filePath, 'utf8');
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (e) {
+      throw new Error(`排练记录文件 ${this.filePath} 不是合法 JSON：${e.message}`);
+    }
+    if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.cues) || !Array.isArray(parsed.records)) {
+      throw new Error(`排练记录文件 ${this.filePath} 结构非法（缺少 cues/records）`);
+    }
+    this.session = parsed;
+    return this.session;
+  }
+
+  save(session) {
+    this.session = session;
+    const dir = path.dirname(this.filePath);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const tmp = `${this.filePath}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(session, null, 2) + '\n', 'utf8');
+    fs.renameSync(tmp, this.filePath); // 原子写入（临时文件 + rename）
+  }
+
+  clear() {
+    this.session = null;
+    if (fs.existsSync(this.filePath)) fs.unlinkSync(this.filePath);
+  }
+}
+
+module.exports = { JsonStore, RehearsalStore, SEED_CUES };
